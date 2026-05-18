@@ -1,0 +1,7 @@
+.git
+.github
+node_modules
+*.md
+src/cursoride_api_v3.4.zip
+token.json
+.env
