@@ -4,8 +4,95 @@
 // ═══════════════════════════════════════════════
 
 const http2 = require('http2');
+const net = require('net');
+const tls = require('tls');
+const url = require('url');
 const { v4: uuidv4 } = require('uuid');
 const config = require('./config');
+
+// ── HTTP CONNECT 代理支持 (HTTPS_PROXY/HTTP_PROXY) ──
+// Node 原生 http2 不支持代理；这里通过 net.connect → CONNECT 隧道 →
+// tls.connect (ALPN h2) → http2.connect(createConnection) 复用 socket。
+function getProxyUrl(targetUrl) {
+  const p = process.env.HTTPS_PROXY || process.env.https_proxy ||
+            process.env.HTTP_PROXY  || process.env.http_proxy  || '';
+  if (!p) return null;
+  const noProxy = (process.env.NO_PROXY || process.env.no_proxy || '').split(',').map(s => s.trim()).filter(Boolean);
+  try {
+    const host = new URL(targetUrl).hostname;
+    for (const rule of noProxy) {
+      if (!rule) continue;
+      if (rule === '*' || host === rule || host.endsWith('.' + rule.replace(/^\./, ''))) return null;
+    }
+  } catch {}
+  return p;
+}
+
+function connectViaProxy(targetUrl, proxyUrl) {
+  return new Promise((resolve, reject) => {
+    const t = new URL(targetUrl);
+    const p = new URL(proxyUrl);
+    const targetHost = t.hostname;
+    const targetPort = Number(t.port) || 443;
+    const proxyHost  = p.hostname;
+    const proxyPort  = Number(p.port) || (p.protocol === 'https:' ? 443 : 80);
+
+    const sock = net.connect({ host: proxyHost, port: proxyPort });
+    let buf = '';
+    const onData = (chunk) => {
+      buf += chunk.toString('binary');
+      const idx = buf.indexOf('\r\n\r\n');
+      if (idx < 0) return;
+      const header = buf.slice(0, idx);
+      sock.removeListener('data', onData);
+      sock.removeListener('error', onErr);
+      const statusLine = header.split('\r\n')[0] || '';
+      const m = statusLine.match(/^HTTP\/1\.[01]\s+(\d{3})/);
+      if (!m || m[1] !== '200') {
+        sock.destroy();
+        return reject(new Error(`Proxy CONNECT failed: ${statusLine}`));
+      }
+      // 升级到 TLS, 协商 ALPN h2
+      const tlsSock = tls.connect({
+        socket: sock,
+        servername: targetHost,
+        ALPNProtocols: ['h2'],
+      }, () => {
+        if (tlsSock.alpnProtocol !== 'h2') {
+          tlsSock.destroy();
+          return reject(new Error(`Proxy ALPN negotiation failed: got ${tlsSock.alpnProtocol}`));
+        }
+        resolve(tlsSock);
+      });
+      tlsSock.once('error', reject);
+    };
+    const onErr = (e) => { sock.destroy(); reject(e); };
+    sock.once('error', onErr);
+    sock.on('data', onData);
+
+    const auth = (p.username || p.password)
+      ? 'Proxy-Authorization: Basic ' + Buffer.from(`${decodeURIComponent(p.username)}:${decodeURIComponent(p.password)}`).toString('base64') + '\r\n'
+      : '';
+    sock.write(
+      `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n` +
+      `Host: ${targetHost}:${targetPort}\r\n` +
+      auth +
+      `\r\n`
+    );
+  });
+}
+
+/**
+ * 创建 HTTP/2 连接 (透明支持 HTTPS_PROXY)
+ * @param {string} authority - e.g. 'https://api2.cursor.sh'
+ * @returns {Promise<Http2Session>}
+ */
+async function connectH2(authority) {
+  const proxy = getProxyUrl(authority);
+  if (!proxy) return http2.connect(authority);
+  const sock = await connectViaProxy(authority, proxy);
+  return http2.connect(authority, { createConnection: () => sock });
+}
 
 // ── Checksum 生成 ──
 function generateChecksum(machineId, macMachineId) {
@@ -129,10 +216,10 @@ function chat(token, prompt, modelId, options = {}) {
     signal = null,         // AbortSignal
   } = options;
 
-  return new Promise((resolve, reject) => {
+  return new Promise(async (resolve, reject) => {
     let client;
     try {
-      client = http2.connect(config.cursor.baseUrl);
+      client = await connectH2(config.cursor.baseUrl);
     } catch (e) {
       return reject(new Error(`Connection failed: ${e.message}`));
     }
@@ -328,8 +415,13 @@ function chat(token, prompt, modelId, options = {}) {
  * 获取可用模型列表
  */
 function getModels(token) {
-  return new Promise((resolve, reject) => {
-    const client = http2.connect(config.cursor.baseUrl);
+  return new Promise(async (resolve, reject) => {
+    let client;
+    try {
+      client = await connectH2(config.cursor.baseUrl);
+    } catch (e) {
+      return reject(new Error(`Connection failed: ${e.message}`));
+    }
     client.on('error', () => {});
     const req = client.request({
       ':method': 'POST',
