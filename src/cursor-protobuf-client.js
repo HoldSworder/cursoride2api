@@ -17,6 +17,13 @@ const CHAT_PATH = '/aiserver.v1.ChatService/StreamUnifiedChatWithTools';
 const DEBUG = process.env.CURSOR_DEBUG === '1';
 const dlog = (...a) => DEBUG && console.log('[CURSOR]', ...a);
 
+function commonPrefixLen(a, b) {
+  const n = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < n && a.charCodeAt(i) === b.charCodeAt(i)) i++;
+  return i;
+}
+
 // ──────────────────────────────────────────────────────────────
 // OpenAI message normalization → Cursor protobuf message list
 // Mirrors 9router/open-sse/translator/request/openai-to-cursor.js
@@ -220,30 +227,56 @@ async function chat(token, openaiMessages, modelId, options = {}) {
 
         if (result.toolCall) {
           const tc = result.toolCall;
-          dlog('frame toolCall: id=', tc.id, 'name=', tc.function.name, 'argsLen=', (tc.function.arguments || '').length, 'isLast=', tc.isLast, 'args=', (tc.function.arguments || '').slice(0, 120));
+          const newArgs = tc.function.arguments || '';
+          dlog('frame toolCall: id=', tc.id, 'name=', tc.function.name, 'argsLen=', newArgs.length, 'isLast=', tc.isLast);
+
           const existing = toolCallsMap.get(tc.id);
           const isFirst = !existing;
+          let argumentsDelta = newArgs;
+
           if (existing) {
-            existing.function.arguments += tc.function.arguments || '';
-            existing.isLast = tc.isLast;
+            // Cursor's StreamUnifiedChatWithTools sends each tool-call frame as
+            // a snapshot of the cumulative arguments string (not a per-frame
+            // increment). Detect by checking whether the new payload is a
+            // prefix-extension of the existing buffer; if so, emit only the
+            // suffix delta. Otherwise treat it as the new full value and emit
+            // the trailing delta from the longest common prefix.
+            const prev = existing.function.arguments;
+            if (newArgs.startsWith(prev)) {
+              argumentsDelta = newArgs.slice(prev.length);
+              existing.function.arguments = newArgs;
+            } else if (prev.startsWith(newArgs)) {
+              argumentsDelta = ''; // older snapshot, ignore
+            } else {
+              // Fallback: replace with the longer of the two snapshots
+              if (newArgs.length >= prev.length) {
+                argumentsDelta = newArgs.slice(commonPrefixLen(prev, newArgs));
+                existing.function.arguments = newArgs;
+              } else {
+                argumentsDelta = '';
+              }
+            }
+            existing.isLast = existing.isLast || tc.isLast;
+            if (tc.function.name) existing.function.name = tc.function.name;
           } else {
             const idx = toolCallsMap.size;
             const entry = {
               id: tc.id,
               type: 'function',
               index: idx,
-              function: { name: tc.function.name, arguments: tc.function.arguments || '' },
+              function: { name: tc.function.name, arguments: newArgs },
               isLast: tc.isLast,
             };
             toolCallsMap.set(tc.id, entry);
             toolCalls.push(entry);
           }
-          if (onToolCallDelta) {
+
+          if (onToolCallDelta && (isFirst || argumentsDelta)) {
             const entry = toolCallsMap.get(tc.id);
             onToolCallDelta({
               id: entry.id,
               name: entry.function.name,
-              argumentsDelta: tc.function.arguments || '',
+              argumentsDelta,
               index: entry.index,
               isFirstChunk: isFirst && !emittedFirst.has(tc.id),
             });
