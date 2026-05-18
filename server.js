@@ -8,7 +8,8 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
-const cursorClient = require('./src/cursor-client');
+const cursorClient = require('./src/cursor-client');           // legacy: getModels only
+const cursorProtoClient = require('./src/cursor-protobuf-client'); // new: chat w/ native tools
 const converter = require('./src/converter');
 
 // ── 配置 ──
@@ -102,8 +103,9 @@ app.get('/v1/models', checkApiKey, async (req, res) => {
 });
 
 // ── POST /v1/chat/completions ──
+// Native tool_calls support via StreamUnifiedChatWithTools protobuf endpoint.
 app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
-  const { messages, model, stream } = req.body;
+  const { messages, model, stream, tools, reasoning_effort } = req.body;
 
   if (!messages || !Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json(converter.buildErrorResponse('messages is required', 'invalid_request_error', 400));
@@ -116,67 +118,123 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
 
   const requestedModel = model || 'gpt-4';
   const cursorModel = converter.mapModel(requestedModel);
-  const prompt = converter.messagesToPrompt(messages);
   const isStream = stream === true;
+  const toolsCount = Array.isArray(tools) ? tools.length : 0;
 
-  console.log(`  📨 [${new Date().toLocaleTimeString()}] ${requestedModel} → ${cursorModel} | stream=${isStream} | ${prompt.substring(0, 80)}...`);
+  console.log(`  📨 [${new Date().toLocaleTimeString()}] ${requestedModel} → ${cursorModel} | stream=${isStream} | tools=${toolsCount} | msgs=${messages.length}`);
+
+  const completionId = `chatcmpl-${uuidv4().replace(/-/g, '').substring(0, 24)}`;
+  const created = Math.floor(Date.now() / 1000);
+
+  // Build OpenAI streaming chunks consistent with spec
+  const buildChunk = (delta, finishReason = null) => ({
+    id: completionId,
+    object: 'chat.completion.chunk',
+    created,
+    model: requestedModel,
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  });
 
   if (isStream) {
-    // ── 流式响应 ──
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders();
-    res.write(converter.buildRoleChunk(requestedModel));
+
+    // Initial role chunk
+    res.write(`data: ${JSON.stringify(buildChunk({ role: 'assistant', content: '' }))}\n\n`);
 
     try {
-      const result = await cursorClient.chat(token, prompt, cursorModel, {
+      const result = await cursorProtoClient.chat(token, messages, cursorModel, {
         stream: true,
-        onDelta: (text) => {
+        tools: tools || [],
+        reasoningEffort: reasoning_effort || null,
+        onText: (text) => {
           if (!res.writableEnded) {
-            res.write(converter.buildStreamChunk(text, requestedModel));
+            res.write(`data: ${JSON.stringify(buildChunk({ content: text }))}\n\n`);
           }
+        },
+        onToolCallDelta: ({ id, name, argumentsDelta, index, isFirstChunk }) => {
+          if (res.writableEnded) return;
+          const toolDelta = {
+            tool_calls: [{
+              index,
+              ...(isFirstChunk ? { id, type: 'function' } : {}),
+              function: {
+                ...(isFirstChunk ? { name } : {}),
+                arguments: argumentsDelta || '',
+              },
+            }],
+          };
+          res.write(`data: ${JSON.stringify(buildChunk(toolDelta))}\n\n`);
         },
       });
 
-      if (result.error && !res.writableEnded) {
-        res.write(converter.buildStreamChunk(`\n\n[Error: ${result.error}]`, requestedModel));
+      const finishReason = (result.toolCalls?.length || 0) > 0 ? 'tool_calls' : 'stop';
+
+      if (result.error && !result.text && (!result.toolCalls || result.toolCalls.length === 0)) {
+        if (!res.writableEnded) {
+          res.write(`data: ${JSON.stringify(buildChunk({ content: `\n\n[Error: ${result.error}]` }))}\n\n`);
+        }
       }
 
       if (!res.writableEnded) {
-        res.write(converter.buildStreamChunk(null, requestedModel, 'stop'));
+        res.write(`data: ${JSON.stringify(buildChunk({}, finishReason))}\n\n`);
         res.write('data: [DONE]\n\n');
         res.end();
       }
 
-      console.log(`  ✅ stream done | in=${result.inputTokens} out=${result.outputTokens}`);
+      console.log(`  ✅ stream done | text=${result.text?.length || 0}c tools=${result.toolCalls?.length || 0}`);
     } catch (e) {
       console.error(`  ❌ stream error: ${e.message}`);
       if (!res.writableEnded) {
-        res.write(converter.buildStreamChunk(`\n\n[Error: ${e.message}]`, requestedModel));
-        res.write(converter.buildStreamChunk(null, requestedModel, 'stop'));
+        res.write(`data: ${JSON.stringify(buildChunk({ content: `\n\n[Error: ${e.message}]` }))}\n\n`);
+        res.write(`data: ${JSON.stringify(buildChunk({}, 'stop'))}\n\n`);
         res.write('data: [DONE]\n\n');
         res.end();
       }
     }
+    return;
+  }
 
-  } else {
-    // ── 非流式响应 ──
-    try {
-      const result = await cursorClient.chat(token, prompt, cursorModel, { stream: false });
+  // Non-stream
+  try {
+    const result = await cursorProtoClient.chat(token, messages, cursorModel, {
+      stream: false,
+      tools: tools || [],
+      reasoningEffort: reasoning_effort || null,
+    });
 
-      if (result.error) {
-        console.error(`  ❌ ${result.error}`);
-        return res.status(500).json(converter.buildErrorResponse(result.error));
-      }
-
-      console.log(`  ✅ done | in=${result.inputTokens} out=${result.outputTokens}`);
-      res.json(converter.buildChatResponse(result.text, requestedModel, result.inputTokens, result.outputTokens));
-    } catch (e) {
-      console.error(`  ❌ ${e.message}`);
-      res.status(500).json(converter.buildErrorResponse(e.message));
+    if (result.error && !result.text && (!result.toolCalls || result.toolCalls.length === 0)) {
+      console.error(`  ❌ ${result.error}`);
+      return res.status(result.status === 401 || result.status === 403 ? result.status : 500)
+        .json(converter.buildErrorResponse(result.error));
     }
+
+    const hasTools = (result.toolCalls?.length || 0) > 0;
+    const finishReason = hasTools ? 'tool_calls' : 'stop';
+    const message = { role: 'assistant', content: result.text || null };
+    if (hasTools) {
+      message.tool_calls = result.toolCalls.map((tc) => ({
+        id: tc.id,
+        type: tc.type || 'function',
+        function: { name: tc.function.name, arguments: tc.function.arguments || '{}' },
+      }));
+    }
+
+    res.json({
+      id: completionId,
+      object: 'chat.completion',
+      created,
+      model: requestedModel,
+      choices: [{ index: 0, message, finish_reason: finishReason }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    });
+    console.log(`  ✅ done | text=${result.text?.length || 0}c tools=${result.toolCalls?.length || 0}`);
+  } catch (e) {
+    console.error(`  ❌ ${e.message}`);
+    res.status(500).json(converter.buildErrorResponse(e.message));
   }
 });
 
