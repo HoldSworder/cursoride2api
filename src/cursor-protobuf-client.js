@@ -220,6 +220,7 @@ async function chat(token, openaiMessages, modelId, options = {}) {
 
         if (result.toolCall) {
           const tc = result.toolCall;
+          dlog('frame toolCall: id=', tc.id, 'name=', tc.function.name, 'argsLen=', (tc.function.arguments || '').length, 'isLast=', tc.isLast, 'args=', (tc.function.arguments || '').slice(0, 120));
           const existing = toolCallsMap.get(tc.id);
           const isFirst = !existing;
           if (existing) {
